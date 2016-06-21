@@ -1,0 +1,14 @@
+<html>
+  <head>
+    <link rel="stylesheet" href="css/reset.css"></link>
+    <link rel="stylesheet" href="css/index.css"></link>
+  </head>
+  <body>
+    <div id='app'></div>
+    <script src="js/index.js"></script>
+    <script>
+        var div = document.getElementById('app');
+        Elm.Main.embed(div, { fragment: location.hash.substring(1) });
+    </script>
+  </body>
+</html>

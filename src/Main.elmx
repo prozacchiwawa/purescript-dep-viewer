@@ -1,0 +1,255 @@
+module Main exposing (..)
+
+import Array exposing (Array(..))
+import Debug exposing (log)
+import Dict exposing (Dict(..))
+import EffModel as EF exposing (EffModel, eff, wrap, unwrap)
+import Html exposing (Html, text)
+import Html.App exposing (programWithFlags)
+import Html.Attributes exposing (property, style)
+import Html.Events exposing (onInput, onClick)
+import Http
+import Json.Decode exposing ((:=), object4)
+import Json.Encode
+import Set exposing (Set(..))
+import String
+import Task exposing (Task)
+
+type Action
+    = NoOp
+    | Reset
+    | Lookup
+    | GotDepGraph DepInfo
+    | GotHttpError String
+    | NameInput String
+    | VersInput String
+
+type alias Flags =
+    { fragment : String
+    }
+
+type DepInfo = DepInfo
+    { ver  : String
+    , name : String
+    , deps : Dict String DepInfo
+    , vers : List String
+    }
+
+type alias Model =
+    { pakname : String
+    , pakvers : String
+    , lookup : Bool
+    , flags : Flags
+    , deps : Maybe DepInfo
+    , error : String
+    , versions : Dict String (Set String)
+    }
+
+viewVersion : DepInfo -> String -> Html Action
+viewVersion (DepInfo d) vers =
+    let link = "/index.html#" ++ d.name ++ "/" ++ vers in
+    <li><a href={link}>{=vers}</a></li>
+
+viewVersions : Model -> Html Action
+viewVersions model =
+    case model.deps of
+        Just (DepInfo d) ->
+            <ul>
+                {:(List.map (viewVersion (DepInfo d)) d.vers)}
+            </ul>
+        Nothing ->
+            <div>No Versions</div>
+
+viewElement : Model -> DepInfo -> Html Action
+viewElement model (DepInfo package) =
+    let packageDanger =
+        Dict.get package.name model.versions
+            |> Maybe.map Set.size
+            |> Maybe.map (\a -> a /= 1)
+            |> Maybe.withDefault False
+    in
+    let elementStyle =
+        style (if packageDanger then ["color" => "#b00"] else ["color" => "#0b0"]) in
+    <div {elementStyle}>
+        {=(package.name ++ "(" ++ package.ver ++ ")")}
+    </div>
+
+viewRow : Model -> DepInfo -> Html Action
+viewRow model (DepInfo package) =
+    let subPackages = package.deps |> Dict.toList |> List.map snd in
+    <div class='analysis-row'>
+        {(viewElement model (DepInfo package))}
+        <div class='analysis-column'>
+            {:(List.map (viewRow model) subPackages)}
+        </div>
+    </div>
+
+viewAnalysis model =
+    case model.deps of
+        Just (DepInfo d) ->
+            <div class='analysis'>{viewRow model (DepInfo d)}</div>
+        Nothing ->
+            <div class='no-analysis'>No analysis</div>
+
+view : Model -> Html Action
+view model =
+    let error =
+        if model.error /= "" then
+            [
+                <div class='error' {onClick Reset}>
+                    <div class='error-center'>{=model.error}</div>
+                </div>
+            ]
+        else
+            []
+    in
+    let loop =
+        if model.lookup then
+            [
+                <div class='lookup'>
+                    <div class='lookup-center'><div class='lookup-anim'></div> Looking up {=model.pakname}#{=model.pakvers}</div>
+                </div>
+            ]
+        else
+            []
+    in
+    let onNameInput = onInput NameInput in
+    let onVersInput = onInput VersInput in
+    <div>
+        {:error}
+        {:loop}
+        <div class='container'>
+            <div class='heading'>
+                <h1>Purescript Dependency Analyzer</h1>
+                <input {onNameInput} {property "value" (Json.Encode.string model.pakname)} placeholder="Start with a package name"></input>
+                <input {onVersInput} {property "value" (Json.Encode.string model.pakvers)} placeholder="Optional version"></input>
+                <button {onClick Lookup}>Start</button>
+            </div>
+            <div class='body'>
+                <div class='other-versions'>
+                    <h2>Other versions</h2>
+                    <ul>
+                        {viewVersions model}
+                    </ul>
+                </div>
+                <div class='analysis-container'>
+                    <h2>Analysis</h2>
+                    {viewAnalysis model}
+                </div>
+            </div>
+        </div>
+    </div>
+
+lazy : (() -> Json.Decode.Decoder a) -> Json.Decode.Decoder a
+lazy thunk =
+  Json.Decode.customDecoder Json.Decode.value
+      (\js -> Json.Decode.decodeValue (thunk ()) js)
+
+decodeDepGraph : Json.Decode.Decoder DepInfo
+decodeDepGraph =
+    let decodeDepGraphInner =
+        Json.Decode.object4 (\a b c d -> DepInfo { ver = a, name = b, deps = c, vers = d })
+            ("ver" := Json.Decode.string)
+            ("name" := Json.Decode.string)
+            ("deps" := Json.Decode.dict (lazy (\_ -> decodeDepGraphInner)))
+            ("vers" := Json.Decode.list Json.Decode.string)
+    in
+    decodeDepGraphInner
+
+makeDepGraphRequest : String -> String -> Task Http.Error DepInfo
+makeDepGraphRequest pakname pakvers =
+    Http.get decodeDepGraph ("deps/" ++ pakname ++ "/" ++ pakvers)
+
+doLookup : EffModel Model Action -> EffModel Model Action
+doLookup effmodel =
+    let pakname = (EF.get effmodel).pakname in
+    let pakvers =
+        case (EF.get effmodel).pakvers of
+            "" -> "master"
+            v -> v
+    in
+    effmodel
+        |> EF.eff
+            ((makeDepGraphRequest pakname pakvers)
+                |> Task.perform (\e -> e |> toString |> GotHttpError) GotDepGraph)
+        |> EF.map (\m -> { m | lookup = True })
+
+init flags =
+    let emptyWithFlags = { flags = flags, pakname = "", pakvers = "", error = "", lookup = False, deps = Nothing, versions = Dict.empty } in
+    let splitFragment = String.split "/" flags.fragment |> Array.fromList in
+    let fragmentParts = (Array.get 0 splitFragment, Array.get 1 splitFragment) in
+    case fragmentParts of
+        (Just "", _) ->
+            emptyWithFlags
+                |> wrap
+                |> unwrap
+        (Just pakname, Just pakvers) ->
+            emptyWithFlags
+                |> wrap
+                |> EF.map (\m -> { m | pakname = pakname, pakvers = pakvers })
+                |> doLookup
+                |> unwrap
+        (Just pakname, Nothing) ->
+            emptyWithFlags
+                |> wrap
+                |> EF.map (\m -> { m | pakname = pakname, pakvers = "master" })
+                |> doLookup
+                |> unwrap
+        _ ->
+            emptyWithFlags
+                |> wrap
+                |> unwrap
+
+collectVersions : DepInfo -> Dict String (Set String) -> Dict String (Set String)
+collectVersions (DepInfo d) versions =
+    let updated =
+        case Dict.get d.name versions of
+            Just s ->
+                Dict.insert d.name (Set.insert d.ver s) versions
+            Nothing ->
+                Dict.insert d.name (Set.insert d.ver Set.empty) versions
+    in
+    List.foldr collectVersions updated (d.deps |> Dict.toList |> List.map snd)
+
+effModelUpdate : Action -> EffModel Model Action -> EffModel Model Action
+effModelUpdate action effmodel =
+    case log "action" action of
+        Reset ->
+            effmodel
+                |> EF.map (\m -> { m | error = "", lookup = False, deps = Nothing, versions = Dict.empty })
+        Lookup ->
+            effmodel |> doLookup
+        GotHttpError e ->
+            effmodel
+                |> EF.map (\m -> { m | error = e, lookup = False, deps = Nothing, versions = Dict.empty })
+        GotDepGraph d ->
+            let versions = collectVersions d Dict.empty in
+            effmodel
+                |> EF.map (\m ->
+                    if m.lookup then
+                        { m | lookup = False, deps = Just d, error = "", versions = versions }
+                    else
+                        m)
+        NameInput n ->
+            effmodel
+                |> EF.map (\m -> { m | pakname = n })
+        VersInput n ->
+            effmodel
+                |> EF.map (\m -> { m | pakvers = n })
+        _ -> effmodel
+
+update action model =
+    model
+        |> wrap
+        |> effModelUpdate action
+        |> unwrap
+
+main =
+    programWithFlags
+        { init = init
+        , view = view
+        , update = update
+        , subscriptions = (\_ -> Sub.none)
+        }
+
+(=>) = (,)

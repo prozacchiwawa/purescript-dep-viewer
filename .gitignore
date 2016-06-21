@@ -1,0 +1,6 @@
+*~
+node_modules
+elm-stuff
+js
+purescript-dep-analyzer.sqlite
+src/Main.elm
